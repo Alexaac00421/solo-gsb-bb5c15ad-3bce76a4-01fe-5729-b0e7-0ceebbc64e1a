@@ -8,6 +8,7 @@ from . import models  # noqa: F401  确保元数据已注册
 from .api import router
 from .config import DB_CONNECT_INTERVAL, DB_CONNECT_RETRIES
 from .db import Base, engine
+from .dispatcher import Dispatcher
 
 
 def _init_db_with_retry() -> None:
@@ -26,15 +27,21 @@ def _init_db_with_retry() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db_with_retry()
-    yield
+    dispatcher = Dispatcher()  # 违规事件回调的后台异步投递
+    dispatcher.start()
+    try:
+        yield
+    finally:
+        dispatcher.stop()
 
 
 app = FastAPI(
     title="铁路司机值勤合规核算服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "司机值勤片段录入/更正、滚动 24h 值勤上限与累计驾驶上限核算、"
-        "跨司机值勤批量调整（批次原子提交）、审核发布与历史对照、违规告警确认"
+        "跨司机值勤批量调整（批次原子提交）、审核发布与历史对照、违规告警确认、"
+        "违规状态变化订阅通知（可重试签名回调）"
     ),
     lifespan=lifespan,
 )

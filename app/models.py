@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import JSON, BigInteger, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 
 from .acknowledgment import STATUS_ACTIVE
@@ -6,6 +6,9 @@ from .db import Base
 
 # PostgreSQL 上使用 JSONB，其他数据库（如本地 sqlite 测试）退化为普通 JSON
 JSONType = JSON().with_variant(JSONB, "postgresql")
+
+# 自增主键：sqlite 仅 INTEGER PRIMARY KEY 支持自增，BigInteger 需退化
+SeqType = BigInteger().with_variant(Integer, "sqlite")
 
 
 class Driver(Base):
@@ -92,3 +95,68 @@ class Acknowledgment(Base):
     invalidation = Column(JSONType, nullable=True)  # 失效原因明细（失效时填充，否则为 NULL）
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     invalidated_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Subscription(Base):
+    """违规状态变化通知订阅：指定司机（NULL = 全体司机）+ 关注规则 + 回调地址 + 共享密钥。
+
+    订阅 ID 由调用方指定并作为幂等键：同 ID 同内容重复登记返回既有记录，
+    同 ID 异内容返回 409。停用（status=DISABLED）为终态：停用后其待投递
+    事件在同一事务内被取消，不再发送。共享密钥仅用于回调签名，查询接口不回显。
+    """
+
+    __tablename__ = "subscriptions"
+
+    subscription_id = Column(String(64), primary_key=True)
+    driver_id = Column(String(64), ForeignKey("drivers.driver_id"), nullable=True, index=True)
+    rules = Column(JSONType, nullable=False)  # 关注规则（排序去重后的规则标识列表）
+    callback_url = Column(String(500), nullable=False)
+    secret = Column(String(200), nullable=False)  # 回调签名共享密钥（不回显）
+    status = Column(String(16), nullable=False, default="ACTIVE")  # ACTIVE / DISABLED
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    disabled_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ViolationEvent(Base):
+    """司机违规规则集合变化事件：与片段变更同一事务落库。
+
+    仅当事务前后违规规则**集合**发生变化才产生（每位受影响司机至多一条）；
+    失败请求随事务回滚、幂等重放不走到事件生成，均不产生事件。
+    ``seq`` 为全局自增序号，写事务由咨询锁串行化，故 seq 顺序即提交顺序；
+    ``event_id`` 为稳定事件 ID，投递重试沿用不变。
+    """
+
+    __tablename__ = "violation_events"
+
+    seq = Column(SeqType, primary_key=True, autoincrement=True)
+    event_id = Column(String(64), unique=True, nullable=False, index=True)
+    driver_id = Column(String(64), ForeignKey("drivers.driver_id"), nullable=False, index=True)
+    rules_before = Column(JSONType, nullable=False)  # 事务前违规规则集合（排序）
+    rules_after = Column(JSONType, nullable=False)  # 事务后违规规则集合（排序）
+    committed_at = Column(DateTime(timezone=True), nullable=False)  # 提交时刻
+
+
+class Delivery(Base):
+    """一条事件对一个订阅的投递记录：事件落库同事务为匹配的活跃订阅创建。
+
+    同一（订阅, 司机）下按事件 seq（提交顺序）逐条投递；超时或非 2xx 保留
+    PENDING 并记录次数与最近错误，按指数退避等待重试；订阅停用时待投递
+    记录被取消（CANCELLED），不再发送。
+    """
+
+    __tablename__ = "deliveries"
+
+    delivery_id = Column(SeqType, primary_key=True, autoincrement=True)
+    event_seq = Column(SeqType, ForeignKey("violation_events.seq"), nullable=False, index=True)
+    event_id = Column(String(64), nullable=False, index=True)  # 冗余稳定事件 ID，便于查询
+    subscription_id = Column(
+        String(64), ForeignKey("subscriptions.subscription_id"), nullable=False, index=True
+    )
+    driver_id = Column(String(64), nullable=False, index=True)  # 冗余事件司机（投递分组键）
+    status = Column(String(16), nullable=False, default="PENDING")  # PENDING/DELIVERED/CANCELLED
+    attempts = Column(Integer, nullable=False, default=0)  # 已尝试次数
+    last_error = Column(String(1000), nullable=True)  # 最近一次错误（成功投递后清空）
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)  # NULL = 立即可投递
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

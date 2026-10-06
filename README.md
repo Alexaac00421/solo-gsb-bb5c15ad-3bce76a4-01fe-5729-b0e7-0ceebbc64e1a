@@ -2,7 +2,8 @@
 
 基于 **FastAPI + PostgreSQL** 的司机值勤合规核算服务：录入司机与值勤片段（驾驶 / 其他值勤 / 休息），
 按现存记录实时核算两项合规规则，支持按修订号更正、**跨司机值勤批量调整（批次原子提交）**、
-审核发布固化历史版本并与当前结果对照，以及对当前违规的**告警确认**（片段变更自动失效）。
+审核发布固化历史版本并与当前结果对照，对当前违规的**告警确认**（片段变更自动失效），
+以及司机违规状态变化时的**订阅通知**（事件与片段变更同事务落库，回调签名投递、失败可重试）。
 
 ## 合规规则
 
@@ -42,6 +43,12 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | `DATABASE_URL` | `postgresql+psycopg2://duty:duty@localhost:5432/duty` | SQLAlchemy 连接串；Compose 中注入为 `...@db:5432/duty` |
 | `DB_CONNECT_RETRIES` | `60` | 启动时等待数据库的重试次数 |
 | `DB_CONNECT_INTERVAL` | `1` | 重试间隔（秒） |
+| `DISPATCH_ENABLED` | `1` | 置 `0` 关闭违规事件的后台回调投递（事件仍落库可查） |
+| `DISPATCH_POLL_INTERVAL` | `1` | 投递器轮询间隔（秒） |
+| `DISPATCH_TIMEOUT` | `5` | 单次回调 HTTP 超时（秒）；超时按失败重试 |
+| `DISPATCH_WORKERS` | `4` | 并行投递的（订阅, 司机）组数；组内严格按序 |
+| `DISPATCH_RETRY_BASE_SECONDS` | `2` | 重试退避基数：第 n 次失败后等待 `base * 2^(n-1)` 秒 |
+| `DISPATCH_RETRY_MAX_SECONDS` | `60` | 重试退避上限（秒） |
 
 端口映射在 `docker-compose.yml` 中：`8000:8000`（API）、`5432:5432`（数据库），按需修改。
 
@@ -65,6 +72,11 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | POST | `/drivers/{driver_id}/acknowledgments` | 告警确认：仅针对当前实时违规创建，固化覆盖的片段修订集合；同司机同规则同修订集合重复提交返回原记录（备注不同不新增） |
 | GET | `/drivers/{driver_id}/acknowledgments` | 确认记录列表（`?status=ACTIVE\|INVALIDATED` 过滤）；失效记录附失效原因 |
 | GET | `/drivers/{driver_id}/acknowledgments/{ack_id}` | 查看单条确认记录（含失效原因） |
+| POST | `/subscriptions` | 登记违规事件订阅：指定司机（缺省 = 全体）+ 关注规则 + 回调地址 + 共享密钥；同 ID 同内容幂等（200），异内容 409 |
+| GET | `/subscriptions` / `/subscriptions/{subscription_id}` | 查询订阅（`?status=ACTIVE\|DISABLED` 过滤；共享密钥不回显） |
+| POST | `/subscriptions/{subscription_id}/deactivate` | 停用订阅：待投递事件同事务取消、不再发送；幂等 |
+| GET | `/events` / `/events/{event_id}` | 按提交顺序查询违规状态变化事件（`?driver_id=` 过滤）；单事件附各订阅投递状态 |
+| GET | `/deliveries` | 查询投递状态（`?subscription_id=&driver_id=&event_id=&status=` 过滤） |
 
 片段类型 `type`：`DRIVING`（驾驶）、`OTHER_DUTY`（其他值勤）、`REST`（休息）。
 时间须为带时区的 ISO 8601（建议 UTC，如 `2026-10-05T08:00:00Z`），服务统一按 UTC 存储与计算。
@@ -257,11 +269,135 @@ curl -s http://localhost:8000/drivers/DRV-1001/acknowledgments/1
 }
 ```
 
+## 违规事件订阅与可重试通知
+
+调度系统可通过订阅在**司机违规规则集合发生变化**时收到 HTTP 回调通知。
+
+### 事件生成
+
+- 片段**录入、按修订号更正、跨司机批量调整**成功提交时，对每位受影响司机比较事务前后的
+  违规规则集合（如 `{CONTINUOUS_DRIVING_LIMIT}` → `{}`），**仅集合变化才各产生一个事件**；
+  规则集合不变（即使越限时刻、参与片段变了）不产生事件。
+- 事件载明：稳定事件 ID（`event_id`，`evt_` 前缀）、司机、变化前后规则集合、提交时刻
+  （`committed_at`，同一事务内所有事件共用）。事件按全局序号 `seq` 排序，写事务由咨询锁
+  串行化，故 `seq` 顺序即提交顺序。
+- 事件与片段变更在**同一事务**落库：失败请求（重叠 409、修订号冲突 409、参数 422、
+  整批拒绝等）随事务回滚不产生事件；幂等重放（同内容片段重试、同批次号重放）也不产生事件。
+- 事件落库与订阅无关：没有订阅时事件照常记录可查；订阅只对**登记之后**的事件生效，不回溯。
+
+### 订阅管理
+
+- 登记：`POST /subscriptions`，请求体含 `subscription_id`（调用方指定，作幂等键）、
+  `driver_id`（缺省 = 订阅全体司机，指定时司机必须已存在，否则 404 `driver_not_found`）、
+  `rules`（关注规则，至少一条，须为 `ROLLING_24H_DUTY_LIMIT` / `CONTINUOUS_DRIVING_LIMIT`）、
+  `callback_url`（必须是带主机名的 http(s) 绝对地址）、`secret`（共享密钥，≥ 8 字符）。
+  参数无效返回 422 并指明原因；同 ID 同内容重复登记幂等返回 200，异内容返回
+  409 `subscription_content_conflict`。
+- 命中规则：订阅的司机范围匹配（指定司机或全体），且**关注规则与事件的变化规则**
+  （前后集合的对称差）**有交集**。某规则前后都在违规集合中、状态未变时，不会触发仅关注
+  该规则的订阅。
+- 停用：`POST /subscriptions/{id}/deactivate`（幂等）。停用为终态：其待投递事件在同一
+  事务内取消（`CANCELLED`）不再发送；之后再产生的新事件也不会为该订阅生成投递。
+  查询订阅不回显共享密钥。
+
+### 投递语义
+
+- 事件落库时，为每个命中的活跃订阅创建一条投递记录（`PENDING`），由后台投递器异步发送
+  （独立会话，与片段写事务互不影响，投递失败不会回滚已提交的片段）。
+- 回调为 POST JSON 报文：`{event_id, subscription_id, driver_id, rules_before, rules_after,
+  committed_at}`，请求头带 `X-Event-Id`、`X-Delivery-Id` 与签名
+  **`X-Signature: sha256=<HMAC-SHA256(secret, 原始请求体) 的十六进制>`**。
+- **同一订阅下同一司机**的事件严格按提交顺序逐条投递：前一条未成功，后一条不越过；
+  不同司机、不同订阅互不阻塞（线程池并行，组内串行）。
+- 超时或非 2xx 响应：保留 `PENDING`，记录尝试次数（`attempts`）与最近错误（`last_error`），
+  按指数退避（`DISPATCH_RETRY_BASE_SECONDS` 起、封顶 `DISPATCH_RETRY_MAX_SECONDS`）等待重试；
+  2xx 标记 `DELIVERED`。**重试沿用同一事件 ID 与报文**（至少一次语义），接收方应按
+  `event_id` 去重。
+
+### 调用示例
+
+```bash
+# 登记订阅：DRV-1001 的两类违规变化推送到回调地址（201；重复提交同内容 -> 200）
+curl -s -X POST http://localhost:8000/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"SUB-DISPATCH-1","driver_id":"DRV-1001",
+       "rules":["ROLLING_24H_DUTY_LIMIT","CONTINUOUS_DRIVING_LIMIT"],
+       "callback_url":"http://dispatcher.internal:9000/duty-events",
+       "secret":"demo-secret-123"}'
+
+# 订阅全体司机（省略 driver_id）
+curl -s -X POST http://localhost:8000/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"SUB-ALL","rules":["CONTINUOUS_DRIVING_LIMIT"],
+       "callback_url":"https://ops.example.com/hooks/duty","secret":"another-secret-456"}'
+
+# 触发一次违规状态变化后，查询事件（按提交顺序）与单个事件的投递状态
+curl -s 'http://localhost:8000/events?driver_id=DRV-1001'
+curl -s http://localhost:8000/events/evt_4af1...
+
+# 查询投递状态：待重试记录含 attempts / last_error / next_retry_at
+curl -s 'http://localhost:8000/deliveries?subscription_id=SUB-DISPATCH-1'
+curl -s 'http://localhost:8000/deliveries?status=PENDING'
+
+# 停用订阅：待投递事件取消、不再发送（幂等）
+curl -s -X POST http://localhost:8000/subscriptions/SUB-DISPATCH-1/deactivate
+curl -s 'http://localhost:8000/subscriptions?status=DISABLED'
+```
+
+事件响应示例：
+
+```json
+{
+  "seq": 7,
+  "event_id": "evt_4af1c2...",
+  "driver_id": "DRV-1001",
+  "rules_before": ["CONTINUOUS_DRIVING_LIMIT"],
+  "rules_after": [],
+  "committed_at": "2026-10-06T03:25:00Z"
+}
+```
+
+投递记录响应示例（回调超时，等待重试）：
+
+```json
+{
+  "delivery_id": 3,
+  "event_id": "evt_4af1c2...",
+  "subscription_id": "SUB-DISPATCH-1",
+  "driver_id": "DRV-1001",
+  "status": "PENDING",
+  "attempts": 2,
+  "last_error": "URLError: <urlopen error [Errno 111] Connection refused>",
+  "last_attempt_at": "2026-10-06T03:25:04Z",
+  "next_retry_at": "2026-10-06T03:25:08Z",
+  "delivered_at": null,
+  "created_at": "2026-10-06T03:25:00Z"
+}
+```
+
+### 回调接收端
+
+仓库附带一个可验签的示例接收端（仅标准库）：
+
+```bash
+SECRET=demo-secret-123 PORT=9000 python3 examples/callback_sink.py
+```
+
+验签要点（接收方自行实现时参考）：对**原始请求体字节**用共享密钥计算 HMAC-SHA256，
+与 `X-Signature` 头（`sha256=<hex>`）做常量时间比较；按 `event_id` 去重；
+处理成功返回 2xx，否则服务会按退避重试。
+
+```python
+import hashlib, hmac
+expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(request.headers["X-Signature"], expected)
+```
+
 
 ## 测试
 
 ```bash
-# 本地（合规引擎与批量排布纯逻辑均仅依赖标准库，无第三方依赖也可运行）
+# 本地（合规引擎、批量排布、告警确认与订阅通知的纯逻辑均仅依赖标准库，无第三方依赖也可运行）
 python3 -m unittest discover -s tests
 
 # 或在容器内运行完整测试
@@ -279,3 +415,4 @@ docker compose run --rm app python -m pytest -q
 - **跨司机批量调整**：批次内容（每条的片段 ID/预期修订/目标司机/起止/类型）规范化为 UTC 并按片段 ID 排序后计算 SHA-256 指纹；批次号主键 + 指纹实现“同内容重放、异内容冲突”。执行时先对全部被调整片段 `SELECT ... FOR UPDATE` 并逐条比对修订号，再按所有调整完成后的**最终排布**分组做重叠检查，全部通过才在同一事务里落库（每条修订号只 +1）并固化批次结果；任何一步失败都回滚、记录零改动。
 - **并发安全**：所有片段写操作（录入 / 单片段更正 / 批量调整）在事务入口获取同一把 PostgreSQL 事务级咨询锁（`pg_advisory_xact_lock`），写事务因此全局串行，并发批次也无法绕过修订与重叠检查；锁随事务提交/回滚自动释放。批量调整的纯排布逻辑在 `app/reassignment.py` 中独立实现（仅依赖标准库）。
 - **告警确认**：确认创建同样持有该咨询锁，与片段写操作全局串行——失效扫描不会漏掉并发创建中的确认记录。确认记录固化提交时覆盖的片段修订集合与命中违规明细；幂等指纹只含司机、规则与修订集合（不含备注），同集合重复提交返回原记录。所有片段写路径（录入 / 更正 / 批量调整）在同事务内把修订集合不再匹配的活跃确认标记为失效并固化失效原因，确认失效与片段变更同生同死。指纹与失效判定的纯逻辑在 `app/acknowledgment.py` 中独立实现（仅依赖标准库）。
+- **违规事件订阅通知**：三条片段写路径在提交前逐司机比较事务前后的违规规则集合，仅集合变化才生成事件，事件与匹配的活跃订阅的待投递记录都和片段变更**同一事务**落库（失败回滚、幂等重放均不产生事件）。事件序号 `seq` 在咨询锁串行化的写事务内分配，即提交顺序。后台投递器（`app/dispatcher.py`，随应用 lifespan 启停）按（订阅, 司机）分组轮询：组内只投队首、严格保序，组间线程池并行互不阻塞；回调以共享密钥 HMAC-SHA256 签名，超时/非 2xx 记录次数与最近错误并指数退避重试，重试沿用事件 ID；投递结果用条件更新落库（`WHERE status='PENDING'`），订阅停用同事务取消待投递，两路并发也不会出现"已停用仍发送"。订阅匹配、签名、退避等纯逻辑在 `app/notification.py` 中独立实现（仅依赖标准库）。

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入 -> 幂等/冲突 -> 重叠校验 -> 合规查询 -> 更正 -> 审核发布 -> 历史对照
 #              -> 跨司机批量调整 -> 告警确认（创建/幂等/失效/再确认）
+#              -> 违规事件订阅（登记/事件与投递查询/重试留痕/停用）
 # 用法: BASE_URL=http://localhost:8000 ./examples/demo.sh
+# 回调地址可用 CALLBACK_URL 覆盖（默认指向本机 9000 端口，可配合 examples/callback_sink.py）
 set -uo pipefail
 
 BASE="${BASE_URL:-http://localhost:8000}"
+CALLBACK_URL="${CALLBACK_URL:-http://localhost:9000/callback}"
 
 req() { # req METHOD PATH [JSON]
   local method="$1" path="$2" data="${3:-}"
@@ -159,3 +162,36 @@ req POST /drivers/DRV-3003/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","
 req GET /drivers/DRV-3003/acknowledgments
 req GET '/drivers/DRV-3003/acknowledgments?status=ACTIVE'
 # 期望：列表两条记录（#1 INVALIDATED 附失效原因，#2 ACTIVE）；过滤后只剩 #2
+
+echo "########## 22. 登记违规事件订阅：DRV-3003、关注两条规则、回调地址与共享密钥"
+req POST /subscriptions "{\"subscription_id\":\"SUB-DEMO\",\"driver_id\":\"DRV-3003\",\"rules\":[\"CONTINUOUS_DRIVING_LIMIT\",\"ROLLING_24H_DUTY_LIMIT\"],\"callback_url\":\"${CALLBACK_URL}\",\"secret\":\"demo-secret-123\"}"
+echo "---- 同 ID 同内容重复登记 -> 幂等 200；同 ID 异内容 -> 409"
+req POST /subscriptions "{\"subscription_id\":\"SUB-DEMO\",\"driver_id\":\"DRV-3003\",\"rules\":[\"CONTINUOUS_DRIVING_LIMIT\",\"ROLLING_24H_DUTY_LIMIT\"],\"callback_url\":\"${CALLBACK_URL}\",\"secret\":\"demo-secret-123\"}"
+req POST /subscriptions '{"subscription_id":"SUB-DEMO","driver_id":"DRV-3003","rules":["ROLLING_24H_DUTY_LIMIT"],"callback_url":"http://localhost:9000/callback","secret":"demo-secret-123"}'
+
+echo "########## 23. 无效订阅参数 -> 明确错误（回调地址非法 / 密钥过短 422；司机不存在 404）"
+req POST /subscriptions '{"subscription_id":"SUB-BAD-1","rules":["CONTINUOUS_DRIVING_LIMIT"],"callback_url":"not-a-url","secret":"demo-secret-123"}'
+req POST /subscriptions '{"subscription_id":"SUB-BAD-2","rules":["CONTINUOUS_DRIVING_LIMIT"],"callback_url":"http://localhost:9000/cb","secret":"short"}'
+req POST /subscriptions '{"subscription_id":"SUB-BAD-3","driver_id":"DRV-9999","rules":["CONTINUOUS_DRIVING_LIMIT"],"callback_url":"http://localhost:9000/cb","secret":"demo-secret-123"}'
+
+echo "########## 24. 触发违规状态变化：SEG-K2 更正为休息 -> 累计驾驶越限消除，同事务产生事件"
+req PATCH /segments/SEG-K2 '{"expected_revision":2,"type":"REST"}'
+req GET /drivers/DRV-3003/compliance
+# 期望：compliant=true；同时生成一条 {CONTINUOUS_DRIVING_LIMIT} -> {} 的事件
+
+echo "########## 25. 查询事件（按提交顺序；事件与片段变更同事务落库）"
+req GET '/events?driver_id=DRV-3003'
+EVENT_ID=$(curl -s "${BASE}/events?driver_id=DRV-3003" | python3 -c "import sys,json;print(json.load(sys.stdin)[-1]['event_id'])")
+echo "---- 单个事件详情（含各订阅投递状态）：${EVENT_ID}"
+req GET "/events/${EVENT_ID}"
+
+echo "########## 26. 投递状态：回调不可达时保留 PENDING，记录尝试次数与最近错误，按退避重试"
+echo "（若已用 SECRET=demo-secret-123 python3 examples/callback_sink.py 起回调接收端，则为 DELIVERED）"
+sleep 3  # 留给后台投递器至少一次尝试
+req GET '/deliveries?subscription_id=SUB-DEMO'
+
+echo "########## 27. 停用订阅 -> 待投递事件取消（CANCELLED）不再发送；停用幂等"
+req POST /subscriptions/SUB-DEMO/deactivate
+req POST /subscriptions/SUB-DEMO/deactivate
+req GET '/deliveries?subscription_id=SUB-DEMO'
+req GET '/subscriptions'

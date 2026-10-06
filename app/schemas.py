@@ -6,6 +6,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .acknowledgment import STATUS_ACTIVE, STATUS_INVALIDATED
 from .compliance import RULE_DRIVING_STINT, RULE_ROLLING_24H
+from .notification import (
+    DELIVERY_CANCELLED,
+    DELIVERY_DELIVERED,
+    DELIVERY_PENDING,
+    SUB_ACTIVE,
+    SUB_DISABLED,
+    is_valid_callback_url,
+)
 
 
 class SegmentType(str, Enum):
@@ -253,3 +261,77 @@ class AcknowledgmentOut(BaseModel):
 class AcknowledgmentResponse(BaseModel):
     created_new: bool  # False 表示同司机同规则同修订集合的确认已存在，返回原记录
     acknowledgment: AcknowledgmentOut
+
+
+# ------------------------------------------------------------ 违规事件订阅与投递
+
+
+class SubscriptionCreate(BaseModel):
+    """登记订阅：指定司机（缺省 = 全体司机）+ 关注规则 + 回调地址 + 共享密钥。"""
+
+    subscription_id: str = Field(min_length=1, max_length=64)
+    driver_id: Optional[str] = Field(default=None, min_length=1, max_length=64)  # 缺省订阅全体司机
+    rules: list[RuleId] = Field(min_length=1)  # 关注的违规规则（至少一条）
+    callback_url: str = Field(min_length=1, max_length=500)
+    secret: str = Field(min_length=8, max_length=200)  # 回调签名共享密钥
+
+    @field_validator("callback_url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        if not is_valid_callback_url(v):
+            raise ValueError("callback_url 必须是带主机名的 http(s) 绝对地址")
+        return v
+
+
+class SubscriptionStatus(str, Enum):
+    ACTIVE = SUB_ACTIVE
+    DISABLED = SUB_DISABLED
+
+
+class SubscriptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    subscription_id: str
+    driver_id: Optional[str]  # NULL 表示订阅全体司机
+    rules: list[str]  # 关注规则（排序去重）
+    callback_url: str
+    status: str  # ACTIVE / DISABLED（共享密钥不回显）
+    created_at: datetime
+    disabled_at: Optional[datetime]
+
+
+class DeliveryStatus(str, Enum):
+    PENDING = DELIVERY_PENDING
+    DELIVERED = DELIVERY_DELIVERED
+    CANCELLED = DELIVERY_CANCELLED
+
+
+class EventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    seq: int  # 全局自增序号（提交顺序）
+    event_id: str  # 稳定事件 ID（投递重试沿用）
+    driver_id: str
+    rules_before: list[str]  # 事务前违规规则集合
+    rules_after: list[str]  # 事务后违规规则集合
+    committed_at: datetime  # 提交时刻
+
+
+class DeliveryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    delivery_id: int
+    event_id: str
+    subscription_id: str
+    driver_id: str
+    status: str  # PENDING / DELIVERED / CANCELLED
+    attempts: int  # 已尝试次数
+    last_error: Optional[str]  # 最近一次错误
+    last_attempt_at: Optional[datetime]
+    next_retry_at: Optional[datetime]
+    delivered_at: Optional[datetime]
+    created_at: datetime
+
+
+class EventDetailOut(EventOut):
+    deliveries: list[DeliveryOut]  # 该事件在各订阅下的投递状态
