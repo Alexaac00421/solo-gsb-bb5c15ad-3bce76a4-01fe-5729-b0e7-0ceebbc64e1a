@@ -253,3 +253,77 @@ class AcknowledgmentOut(BaseModel):
 class AcknowledgmentResponse(BaseModel):
     created_new: bool  # False 表示同司机同规则同修订集合的确认已存在，返回原记录
     acknowledgment: AcknowledgmentOut
+
+
+# ------------------------------------------------------------ 违规变更通知订阅
+
+
+class SubscriptionCreate(BaseModel):
+    """登记违规变更通知订阅。
+
+    - driver_id 缺省（null）表示全体司机；否则只订阅指定司机（须已存在）；
+    - rules 为关注规则标识列表（至少一个，未知标识 400）；
+    - callback_url 为 http(s) 回调地址；secret 为 HMAC-SHA256 签名共享密钥。
+    """
+
+    subscription_id: str = Field(min_length=1, max_length=64)
+    driver_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    rules: list[str] = Field(min_length=1)
+    callback_url: str = Field(min_length=1, max_length=2000)
+    secret: str = Field(min_length=1, max_length=128)
+
+
+class SubscriptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    subscription_id: str
+    driver_id: Optional[str]  # null 表示全体司机
+    rules: list[str]
+    callback_url: str
+    status: str  # ACTIVE / DISABLED
+    created_at: datetime
+    disabled_at: Optional[datetime]
+    # 共享密钥仅登记时由调用方持有，查询不回显
+
+
+class SubscriptionResponse(BaseModel):
+    created_new: bool  # False 表示同 ID 同内容幂等重放，返回既有订阅
+    subscription: SubscriptionOut
+
+
+class DeliveryOut(BaseModel):
+    """单条投递状态（重试沿用同一 event_id）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    delivery_id: int
+    event_id: int
+    subscription_id: str
+    driver_id: str
+    status: str  # PENDING / FAILED / SUCCEEDED / CANCELLED
+    attempts: int
+    last_error: Optional[str]
+    last_response_code: Optional[int]
+    next_attempt_at: Optional[datetime]
+    delivered_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+class EventOut(BaseModel):
+    """违规规则集合变更事件（稳定事件 ID、司机、变化前后规则、提交时刻）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    event_id: int
+    driver_id: str
+    rules_before: list[str]
+    rules_after: list[str]
+    committed_at: datetime
+    created_at: datetime
+
+
+class EventDetailOut(EventOut):
+    """事件详情：附各订阅投递状态。"""
+
+    deliveries: list[DeliveryOut]

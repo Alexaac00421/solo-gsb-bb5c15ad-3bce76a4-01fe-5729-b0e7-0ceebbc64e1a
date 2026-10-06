@@ -17,6 +17,22 @@ from .acknowledgment import (
 )
 from .compliance import Seg, evaluate_driver
 from .db import get_db
+from .dispatcher import dispatcher
+from .notifications import (
+    DELIVERY_CANCELLED,
+    DELIVERY_PENDING,
+    DELIVERY_FAILED,
+    SUB_ACTIVE,
+    SUB_DISABLED,
+    SubscriptionError,
+    event_payload,
+    rule_set,
+    rule_set_delta,
+    subscription_matches,
+    validate_callback_url,
+    validate_rules,
+    validate_secret,
+)
 from .reassignment import (
     BatchRejection,
     Move,
@@ -120,6 +136,76 @@ def _invalidate_stale_acknowledgments(db: Session, driver_id: str) -> None:
         ack.invalidated_at = now
 
 
+# ------------------------------------------------------- 违规变更事件产生
+
+def _emit_violation_events(
+    db: Session,
+    deltas: dict[str, dict | None],
+    committed_at: datetime,
+) -> None:
+    """片段变更落库后、提交前调用：为每个违规规则集合发生变化的受影响司机
+    产生一个事件，并为每个匹配的**活跃**订阅在同一事务内创建 PENDING 投递记录。
+
+    - 仅集合变化才产生事件（``deltas`` 中 value 为 None 的司机跳过）；
+    - 与片段变更同事务：片段回滚则事件与投递记录一并回滚；
+    - 稳定事件 ID 由 violation_events 序列在本事务内分配，重试沿用同一 ID；
+    - 事件本身始终落库（可经事件查询接口审计）；投递记录仅为匹配的活跃订阅扇出；
+    - 调用方（片段写路径）持咨询锁全局串行，同司机事件 ID 顺序即提交顺序。
+    """
+    if not deltas:
+        return
+    active_subs = list(
+        db.execute(
+            select(models.NotificationSubscription).where(
+                models.NotificationSubscription.status == SUB_ACTIVE
+            )
+        ).scalars()
+    )
+
+    for driver_id in sorted(deltas):
+        delta = deltas[driver_id]
+        if delta is None:
+            continue  # 事务前后违规规则集合相同：不产生事件
+        before_rules = frozenset(delta["rules_before"])
+        after_rules = frozenset(delta["rules_after"])
+        event = models.ViolationEvent(
+            driver_id=driver_id,
+            rules_before=delta["rules_before"],
+            rules_after=delta["rules_after"],
+            committed_at=committed_at,
+        )
+        db.add(event)
+        db.flush()  # 取得稳定 event_id
+        event.payload = event_payload(
+            event_id=event.event_id,
+            driver_id=driver_id,
+            rules_before=delta["rules_before"],
+            rules_after=delta["rules_after"],
+            committed_at=committed_at.astimezone(timezone.utc).isoformat(),
+        )
+        db.flush()
+
+        for sub in active_subs:
+            if not subscription_matches(
+                subscription_driver_id=sub.driver_id,
+                subscription_rules=frozenset(sub.rules),
+                event_driver_id=driver_id,
+                rules_before=before_rules,
+                rules_after=after_rules,
+            ):
+                continue
+            db.add(
+                models.EventDelivery(
+                    event_id=event.event_id,
+                    subscription_id=sub.subscription_id,
+                    driver_id=driver_id,
+                    status=DELIVERY_PENDING,
+                    attempts=0,
+                )
+            )
+        db.flush()
+
+
 # ---------------------------------------------------------------- 司机
 
 @router.post("/drivers", response_model=schemas.DriverOut, status_code=201, tags=["drivers"])
@@ -176,6 +262,10 @@ def create_segment(body: schemas.SegmentCreate, response: Response, db: Session 
     _get_driver_or_404(db, body.driver_id)
     _ensure_no_overlap(db, body.driver_id, body.start_utc, body.end_utc)
 
+    # 事务前违规规则集合（按现存记录重算）
+    committed_at = datetime.now(timezone.utc)
+    before_rules = rule_set(_evaluate_current(db, body.driver_id))
+
     seg = models.Segment(
         segment_id=body.segment_id,
         driver_id=body.driver_id,
@@ -187,8 +277,15 @@ def create_segment(body: schemas.SegmentCreate, response: Response, db: Session 
     db.add(seg)
     db.flush()  # 让失效扫描读到新片段（会话 autoflush=False）
     _invalidate_stale_acknowledgments(db, body.driver_id)  # 新增片段使修订集合不匹配的确认失效
+
+    # 仅当违规规则集合变化才产生事件；与片段变更同事务落库
+    after_rules = rule_set(_evaluate_current(db, body.driver_id))
+    _emit_violation_events(
+        db, {body.driver_id: rule_set_delta(before_rules, after_rules)}, committed_at
+    )
     db.commit()
     db.refresh(seg)
+    dispatcher.wake()  # 提交后尽快触发异步投递（投递失败不影响本请求）
     return seg
 
 
@@ -231,6 +328,11 @@ def correct_segment(segment_id: str, body: schemas.SegmentPatch, db: Session = D
     _ensure_no_overlap(db, new_driver, new_start, new_end, exclude_segment_id=segment_id)
 
     old_driver = seg.driver_id
+    affected_drivers = sorted({old_driver, new_driver})
+    # 事务前违规规则集合（源司机 ∪ 目标司机）
+    committed_at = datetime.now(timezone.utc)
+    before_rules = {d: rule_set(_evaluate_current(db, d)) for d in affected_drivers}
+
     seg.driver_id = new_driver
     seg.start_utc = new_start
     seg.end_utc = new_end
@@ -241,8 +343,16 @@ def correct_segment(segment_id: str, body: schemas.SegmentPatch, db: Session = D
     _invalidate_stale_acknowledgments(db, new_driver)
     if old_driver != new_driver:
         _invalidate_stale_acknowledgments(db, old_driver)
+
+    # 仅当某司机违规规则集合变化才各产生一个事件；与片段更正同事务落库
+    deltas = {
+        d: rule_set_delta(before_rules[d], rule_set(_evaluate_current(db, d)))
+        for d in affected_drivers
+    }
+    _emit_violation_events(db, deltas, committed_at)
     db.commit()
     db.refresh(seg)
+    dispatcher.wake()
     return seg
 
 
@@ -350,6 +460,7 @@ def submit_reassignment_batch(
         db.commit()
         raise _batch_error(exc)
 
+    dispatcher.wake()  # 事件已同事务落库，唤醒异步投递（失败请求/重放不会走到这里）
     response.status_code = 201
     return result
 
@@ -435,6 +546,14 @@ def _apply_reassignment_batch(
 
     # 7. 调整后的实时合规结论
     after = {d: _compliance_summary(db, d, evaluated_at) for d in affected}
+
+    # 7.5 违规变更事件：按受影响司机比较事务前后违规规则集合，仅集合变化才
+    # 各产生一个事件；与片段调整、批次记录同事务落库（失败整批回滚则无事件）。
+    # before/after 已在上面分别按调整前/最终排布重算。
+    deltas = {
+        d: rule_set_delta(rule_set(before[d]), rule_set(after[d])) for d in affected
+    }
+    _emit_violation_events(db, deltas, evaluated_at)
 
     segment_changes = [
         {
@@ -749,3 +868,305 @@ def compare_audit(driver_id: str, audit_id: int, db: Session = Depends(get_db)):
         results_differ=current_result["violations"] != snap.result["violations"],
         input_changes=input_changes,
     )
+
+
+# ------------------------------------------------------------ 违规变更通知订阅
+
+
+def _invalid_subscription(exc: SubscriptionError) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": "invalid_subscription",
+            "message": str(exc),
+            **({"field": exc.field} if exc.field else {}),
+        },
+    )
+
+
+def _normalize_subscription_body(body: schemas.SubscriptionCreate) -> tuple[str | None, list[str], str, str]:
+    """校验订阅参数并返回 (driver_id, rules 去重排序, callback_url, secret)。"""
+    try:
+        rules = validate_rules(body.rules)
+        callback_url = validate_callback_url(body.callback_url)
+        secret = validate_secret(body.secret)
+    except SubscriptionError as exc:
+        raise _invalid_subscription(exc)
+    return body.driver_id, rules, callback_url, secret
+
+
+@router.post(
+    "/notification-subscriptions",
+    response_model=schemas.SubscriptionResponse,
+    status_code=201,
+    tags=["notification-subscriptions"],
+)
+def create_subscription(
+    body: schemas.SubscriptionCreate, response: Response, db: Session = Depends(get_db)
+):
+    """登记违规变更通知订阅。
+
+    - ``driver_id`` 缺省（null）订阅全体司机，否则只订阅指定司机（须已存在，
+      否则 404 ``driver_not_found``）；``rules`` 指定关注规则（至少一个，
+      未知标识返回 400 ``invalid_subscription``）；``callback_url`` 为 http(s)
+      回调地址；``secret`` 为 HMAC-SHA256 签名共享密钥（8~128 字符）。
+    - 订阅 ID 即幂等键：同 ID 同内容重放返回 200 既有订阅（``created_new=false``），
+      同 ID 异内容返回 409 ``subscription_content_conflict``。
+    """
+    driver_id, rules, callback_url, secret = _normalize_subscription_body(body)
+    if driver_id is not None and db.get(models.Driver, driver_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "driver_not_found",
+                "message": f"司机 '{driver_id}' 不存在",
+                "driver_id": driver_id,
+            },
+        )
+
+    existing = db.get(models.NotificationSubscription, body.subscription_id)
+    if existing is not None:
+        same = (
+            existing.driver_id == driver_id
+            and list(existing.rules) == rules
+            and existing.callback_url == callback_url
+            and existing.secret == secret
+        )
+        if not same:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "subscription_content_conflict",
+                    "message": f"订阅 ID '{body.subscription_id}' 已存在且内容不一致",
+                    "subscription_id": body.subscription_id,
+                },
+            )
+        response.status_code = 200
+        return schemas.SubscriptionResponse(created_new=False, subscription=existing)
+
+    sub = models.NotificationSubscription(
+        subscription_id=body.subscription_id,
+        driver_id=driver_id,
+        rules=rules,
+        callback_url=callback_url,
+        secret=secret,
+        status=SUB_ACTIVE,
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return schemas.SubscriptionResponse(created_new=True, subscription=sub)
+
+
+@router.post(
+    "/notification-subscriptions/{subscription_id}/disable",
+    response_model=schemas.SubscriptionOut,
+    tags=["notification-subscriptions"],
+)
+def disable_subscription(subscription_id: str, db: Session = Depends(get_db)):
+    """停用订阅（幂等）：停用后该订阅尚待投递（含重试中）的事件不再发送，
+    既有投递记录标记 CANCELLED 保留可查；已成功的投递记录保持 SUCCEEDED。
+    已停用时再次调用返回 200 既有记录。
+    """
+    sub = db.get(models.NotificationSubscription, subscription_id)
+    if sub is None:
+        raise HTTPException(
+            status_code=404, detail=f"订阅 '{subscription_id}' 不存在"
+        )
+    if sub.status == SUB_ACTIVE:
+        sub.status = SUB_DISABLED
+        sub.disabled_at = datetime.now(timezone.utc)
+        db.execute(
+            models.EventDelivery.__table__.update()
+            .where(
+                models.EventDelivery.subscription_id == subscription_id,
+                models.EventDelivery.status.in_([DELIVERY_PENDING, DELIVERY_FAILED]),
+            )
+            .values(
+                status=DELIVERY_CANCELLED,
+                next_attempt_at=None,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+        db.refresh(sub)
+    return sub
+
+
+@router.get(
+    "/notification-subscriptions",
+    response_model=list[schemas.SubscriptionOut],
+    tags=["notification-subscriptions"],
+)
+def list_subscriptions(
+    driver_id: str | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """列出订阅；可按司机（含 ``driver_id=all`` 只看全体司机订阅）与状态过滤。"""
+    stmt = select(models.NotificationSubscription)
+    if driver_id is not None:
+        if driver_id == "all":
+            stmt = stmt.where(models.NotificationSubscription.driver_id.is_(None))
+        else:
+            stmt = stmt.where(models.NotificationSubscription.driver_id == driver_id)
+    if status is not None:
+        status_u = status.upper()
+        if status_u not in (SUB_ACTIVE, SUB_DISABLED):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_subscription",
+                    "message": f"非法订阅状态 '{status}'，合法值: ACTIVE / DISABLED",
+                    "field": "status",
+                },
+            )
+        stmt = stmt.where(models.NotificationSubscription.status == status_u)
+    stmt = stmt.order_by(models.NotificationSubscription.subscription_id)
+    return list(db.execute(stmt).scalars())
+
+
+@router.get(
+    "/notification-subscriptions/{subscription_id}",
+    response_model=schemas.SubscriptionOut,
+    tags=["notification-subscriptions"],
+)
+def get_subscription(subscription_id: str, db: Session = Depends(get_db)):
+    sub = db.get(models.NotificationSubscription, subscription_id)
+    if sub is None:
+        raise HTTPException(
+            status_code=404, detail=f"订阅 '{subscription_id}' 不存在"
+        )
+    return sub
+
+
+# ---------------------------------------------------------------- 事件查询
+
+_ALLOWED_DELIVERY_STATUS = ("PENDING", "FAILED", "SUCCEEDED", "CANCELLED")
+
+
+def _delivery_status_filter(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    up = value.upper()
+    if up not in _ALLOWED_DELIVERY_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_delivery_status",
+                "message": (
+                    f"非法投递状态 '{value}'，合法值: " + ", ".join(_ALLOWED_DELIVERY_STATUS)
+                ),
+                "field": "delivery_status",
+            },
+        )
+    return [up]
+
+
+@router.get(
+    "/drivers/{driver_id}/violation-events",
+    response_model=list[schemas.EventOut],
+    tags=["notification-events"],
+)
+def list_driver_violation_events(
+    driver_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """查询某司机的违规规则集合变更事件（按提交顺序/event_id 倒序返回，最新在前）。"""
+    _get_driver_or_404(db, driver_id)
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+    stmt = (
+        select(models.ViolationEvent)
+        .where(models.ViolationEvent.driver_id == driver_id)
+        .order_by(models.ViolationEvent.event_id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(db.execute(stmt).scalars())
+
+
+@router.get(
+    "/drivers/{driver_id}/violation-events/{event_id}",
+    response_model=schemas.EventDetailOut,
+    tags=["notification-events"],
+)
+def get_driver_violation_event(
+    driver_id: str,
+    event_id: int,
+    delivery_status: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """查看单个事件及其各订阅投递状态（重试次数、最近错误、下次重试时刻）。
+
+    可用 ``?delivery_status=FAILED`` 等只看特定状态的投递。
+    """
+    _get_driver_or_404(db, driver_id)
+    event = db.get(models.ViolationEvent, event_id)
+    if event is None or event.driver_id != driver_id:
+        raise HTTPException(status_code=404, detail=f"事件 '{event_id}' 不存在")
+    stmt = (
+        select(models.EventDelivery)
+        .where(models.EventDelivery.event_id == event_id)
+        .order_by(models.EventDelivery.delivery_id)
+    )
+    statuses = _delivery_status_filter(delivery_status)
+    if statuses is not None:
+        stmt = stmt.where(models.EventDelivery.status.in_(statuses))
+    deliveries = list(db.execute(stmt).scalars())
+    return schemas.EventDetailOut(
+        event_id=event.event_id,
+        driver_id=event.driver_id,
+        rules_before=event.rules_before,
+        rules_after=event.rules_after,
+        committed_at=_utc(event.committed_at),
+        created_at=_utc(event.created_at),
+        deliveries=deliveries,
+    )
+
+
+@router.get(
+    "/notification-subscriptions/{subscription_id}/deliveries",
+    response_model=list[schemas.DeliveryOut],
+    tags=["notification-events"],
+)
+def list_subscription_deliveries(
+    subscription_id: str,
+    driver_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """查询某订阅的投递状态（重试沿用同一事件 ID）。
+
+    可按 ``driver_id``、``status``（PENDING/FAILED/SUCCEEDED/CANCELLED）过滤；
+    默认按 (司机, event_id) 排序，直观呈现“同订阅同司机按提交顺序投递”。
+    """
+    sub = db.get(models.NotificationSubscription, subscription_id)
+    if sub is None:
+        raise HTTPException(
+            status_code=404, detail=f"订阅 '{subscription_id}' 不存在"
+        )
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+    stmt = select(models.EventDelivery).where(
+        models.EventDelivery.subscription_id == subscription_id
+    )
+    if driver_id is not None:
+        stmt = stmt.where(models.EventDelivery.driver_id == driver_id)
+    if status is not None:
+        statuses = _delivery_status_filter(status)
+        stmt = stmt.where(models.EventDelivery.status.in_(statuses))
+    stmt = (
+        stmt.order_by(
+            models.EventDelivery.driver_id,
+            models.EventDelivery.event_id,
+            models.EventDelivery.delivery_id,
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(db.execute(stmt).scalars())

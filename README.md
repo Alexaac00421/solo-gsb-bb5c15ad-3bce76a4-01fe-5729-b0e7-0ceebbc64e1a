@@ -2,7 +2,8 @@
 
 基于 **FastAPI + PostgreSQL** 的司机值勤合规核算服务：录入司机与值勤片段（驾驶 / 其他值勤 / 休息），
 按现存记录实时核算两项合规规则，支持按修订号更正、**跨司机值勤批量调整（批次原子提交）**、
-审核发布固化历史版本并与当前结果对照，以及对当前违规的**告警确认**（片段变更自动失效）。
+审核发布固化历史版本并与当前结果对照，以及对当前违规的**告警确认**（片段变更自动失效），
+并向调度系统提供违规规则集合变更的**可重试通知订阅**（异步 HMAC 签名回调）。
 
 ## 合规规则
 
@@ -42,6 +43,10 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | `DATABASE_URL` | `postgresql+psycopg2://duty:duty@localhost:5432/duty` | SQLAlchemy 连接串；Compose 中注入为 `...@db:5432/duty` |
 | `DB_CONNECT_RETRIES` | `60` | 启动时等待数据库的重试次数 |
 | `DB_CONNECT_INTERVAL` | `1` | 重试间隔（秒） |
+| `DISPATCH_POLL_INTERVAL` | `0.5` | 回调投递器轮询待投递队列的间隔（秒） |
+| `DISPATCH_TIMEOUT` | `5` | 单次回调 HTTP 超时（秒）；超时按失败处理并退避重试 |
+| `DISPATCH_RETRY_BASE` / `DISPATCH_RETRY_FACTOR` / `DISPATCH_RETRY_MAX` | `1` / `2` / `300` | 失败退避：第 n 次等待 `BASE × FACTOR^(n-1)` 秒，封顶 MAX（秒） |
+| `DISPATCH_BATCH_SIZE` | `32` | 每轮最多认领多少个“（订阅, 司机）队头” |
 
 端口映射在 `docker-compose.yml` 中：`8000:8000`（API）、`5432:5432`（数据库），按需修改。
 
@@ -65,6 +70,12 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | POST | `/drivers/{driver_id}/acknowledgments` | 告警确认：仅针对当前实时违规创建，固化覆盖的片段修订集合；同司机同规则同修订集合重复提交返回原记录（备注不同不新增） |
 | GET | `/drivers/{driver_id}/acknowledgments` | 确认记录列表（`?status=ACTIVE\|INVALIDATED` 过滤）；失效记录附失效原因 |
 | GET | `/drivers/{driver_id}/acknowledgments/{ack_id}` | 查看单条确认记录（含失效原因） |
+| POST | `/notification-subscriptions` | 登记违规变更通知订阅（指定司机或全体司机、关注规则、回调地址、共享密钥）；同 ID 同内容幂等 |
+| POST | `/notification-subscriptions/{subscription_id}/disable` | 停用订阅（幂等）；待投递事件标记 CANCELLED 不再发送 |
+| GET | `/notification-subscriptions` / `/{subscription_id}` | 查询订阅（可按 `driver_id`、`status` 过滤；`driver_id=all` 只看全体订阅） |
+| GET | `/drivers/{driver_id}/violation-events` | 查询司机的违规规则集合变更事件（稳定事件 ID、变化前后规则、提交时刻） |
+| GET | `/drivers/{driver_id}/violation-events/{event_id}` | 查看单个事件及各订阅投递状态（次数 / 最近错误 / 下次重试时刻） |
+| GET | `/notification-subscriptions/{subscription_id}/deliveries` | 查询某订阅的投递状态（可按 `driver_id`、`status` 过滤） |
 
 片段类型 `type`：`DRIVING`（驾驶）、`OTHER_DUTY`（其他值勤）、`REST`（休息）。
 时间须为带时区的 ISO 8601（建议 UTC，如 `2026-10-05T08:00:00Z`），服务统一按 UTC 存储与计算。
@@ -258,10 +269,128 @@ curl -s http://localhost:8000/drivers/DRV-1001/acknowledgments/1
 ```
 
 
+## 违规状态变更通知（可重试回调）
+
+调度系统通过订阅获得司机违规状态变化通知。
+
+### 订阅
+
+- `POST /notification-subscriptions`，请求体：
+  - `subscription_id`：调用方指定的订阅 ID（即幂等键，最长 64）；
+  - `driver_id`：**缺省 / null 表示全体司机**；否则只订阅该司机（须已存在，否则 404）；
+  - `rules`：关注规则标识列表，至少一个，合法值
+    `ROLLING_24H_DUTY_LIMIT`、`CONTINUOUS_DRIVING_LIMIT`（未知值 400）；
+  - `callback_url`：http(s) 回调地址；`secret`：8~128 字符共享密钥。
+- 参数不合法统一返回 **400 `invalid_subscription`**（响应附 `field` 与原因）。
+- 同 ID 同内容重放返回 200 既有订阅（`created_new=false`）；同 ID 异内容 409
+  `subscription_content_conflict`。
+- `POST /notification-subscriptions/{id}/disable` 停用（幂等）：停用后该订阅
+  尚待投递（含重试中）的事件**不再发送**，记录置 `CANCELLED` 保留可查；已成功的保持 `SUCCEEDED`。
+
+### 事件何时产生
+
+片段**录入（POST /segments）、更正（PATCH /segments/{id}）、跨司机批量调整
+（POST /reassignment-batches）成功提交**时，按受影响司机（更正含调入/调出双方，
+批量为源司机 ∪ 目标司机）比较**事务前后的违规规则标识集合**：
+
+- **仅集合变化**才为该司机各产生一个事件；集合相同（即使首次越限时刻或参与
+  片段变化）不产生事件；
+- 事件与片段变更在**同一数据库事务**内落库：片段回滚（失败请求）则事件不出现；
+  **失败请求与幂等重放不产生事件**；
+- 事件字段：稳定 `event_id`（全局递增序列，重试始终沿用）、`driver_id`、
+  `rules_before` / `rules_after`（排序后的规则标识）、`committed_at`（提交时刻）。
+
+事件载荷（即回调请求体）：
+
+```json
+{
+  "event_id": 42,
+  "event_type": "driver.violation_rules.changed",
+  "driver_id": "DRV-1001",
+  "rules_before": [],
+  "rules_after": ["CONTINUOUS_DRIVING_LIMIT"],
+  "committed_at": "2026-10-06T04:00:00+00:00"
+}
+```
+
+### 异步投递与重试
+
+- 投递由应用进程内后台线程执行（**保持现有启动方式**，无额外进程/中间件），
+  回调失败不影响写请求、**不回滚已提交片段**，也不阻塞其他司机或订阅；
+- 回调为 `POST application/json`，以共享密钥签名头：
+  `X-Signature: v1=hex(HMAC_SHA256(secret, f"{timestamp}.{原始请求体字节}"))`、
+  `X-Signature-Timestamp`、`X-Event-Id`、`X-Delivery-Id`；
+- 接收方返回 **2xx 视为成功**；超时或非 2xx 响应：投递记录保留为 `FAILED`，
+  记录 `attempts`（次数）、`last_error`、`last_response_code` 与指数退避后的
+  `next_attempt_at`，按 `1s, 2s, 4s …`（封顶 300s，可用环境变量调）继续重试，
+  **重试沿用同一事件 ID**（整体为至少一次投递，接收方应按 `X-Event-Id` 幂等）；
+- **同一订阅下同一司机的事件严格按提交顺序投递**：每（订阅, 司机）队列只放行
+  `event_id` 最小的未完成队头，队头处于失败/退避时后续事件等待、不超车；
+- 匹配规则：指定司机订阅只收该司机事件，全体司机订阅收所有司机；关注规则集合
+  与 `rules_before ∪ rules_after` 有交集才投递（新增、消除、规则间转换都可命中）。
+
+接收端验签示例（Python）：
+
+```python
+import hmac, hashlib
+expected = hmac.new(
+    b"shared-secret-01",
+    (headers["X-Signature-Timestamp"] + ".").encode() + raw_body_bytes,
+    hashlib.sha256,
+).hexdigest()
+assert hmac.compare_digest(expected, headers["X-Signature"].removeprefix("v1="))
+```
+
+### 订阅与投递查询
+
+```bash
+# 全体司机、全部规则
+curl -s -X POST http://localhost:8000/notification-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"SUB-ALL-01",
+       "rules":["ROLLING_24H_DUTY_LIMIT","CONTINUOUS_DRIVING_LIMIT"],
+       "callback_url":"https://scheduler.example/hooks/duty",
+       "secret":"shared-secret-01"}'
+
+# 仅订阅某司机的累计驾驶违规
+curl -s -X POST http://localhost:8000/notification-subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"subscription_id":"SUB-DRV-1001","driver_id":"DRV-1001",
+       "rules":["CONTINUOUS_DRIVING_LIMIT"],
+       "callback_url":"https://scheduler.example/hooks/drv-1001",
+       "secret":"shared-secret-02"}'
+
+# 停用（幂等；待投递不再发送）
+curl -s -X POST http://localhost:8000/notification-subscriptions/SUB-DRV-1001/disable
+
+# 查询事件与投递状态
+curl -s http://localhost:8000/drivers/DRV-1001/violation-events
+curl -s http://localhost:8000/drivers/DRV-1001/violation-events/42
+curl -s 'http://localhost:8000/notification-subscriptions/SUB-DRV-1001/deliveries?status=FAILED'
+```
+
+投递状态对象示例：
+
+```json
+{
+  "delivery_id": 7,
+  "event_id": 42,
+  "subscription_id": "SUB-DRV-1001",
+  "driver_id": "DRV-1001",
+  "status": "FAILED",
+  "attempts": 3,
+  "last_error": "HTTP 503: busy",
+  "last_response_code": 503,
+  "next_attempt_at": "2026-10-06T04:00:04Z",
+  "delivered_at": null
+}
+```
+
+
 ## 测试
 
 ```bash
-# 本地（合规引擎与批量排布纯逻辑均仅依赖标准库，无第三方依赖也可运行）
+# 本地（合规引擎、批量排布、告警确认与通知订阅/投递纯逻辑均仅依赖标准库，无第三方依赖也可运行）
 python3 -m unittest discover -s tests
 
 # 或在容器内运行完整测试
@@ -279,3 +408,5 @@ docker compose run --rm app python -m pytest -q
 - **跨司机批量调整**：批次内容（每条的片段 ID/预期修订/目标司机/起止/类型）规范化为 UTC 并按片段 ID 排序后计算 SHA-256 指纹；批次号主键 + 指纹实现“同内容重放、异内容冲突”。执行时先对全部被调整片段 `SELECT ... FOR UPDATE` 并逐条比对修订号，再按所有调整完成后的**最终排布**分组做重叠检查，全部通过才在同一事务里落库（每条修订号只 +1）并固化批次结果；任何一步失败都回滚、记录零改动。
 - **并发安全**：所有片段写操作（录入 / 单片段更正 / 批量调整）在事务入口获取同一把 PostgreSQL 事务级咨询锁（`pg_advisory_xact_lock`），写事务因此全局串行，并发批次也无法绕过修订与重叠检查；锁随事务提交/回滚自动释放。批量调整的纯排布逻辑在 `app/reassignment.py` 中独立实现（仅依赖标准库）。
 - **告警确认**：确认创建同样持有该咨询锁，与片段写操作全局串行——失效扫描不会漏掉并发创建中的确认记录。确认记录固化提交时覆盖的片段修订集合与命中违规明细；幂等指纹只含司机、规则与修订集合（不含备注），同集合重复提交返回原记录。所有片段写路径（录入 / 更正 / 批量调整）在同事务内把修订集合不再匹配的活跃确认标记为失效并固化失效原因，确认失效与片段变更同生同死。指纹与失效判定的纯逻辑在 `app/acknowledgment.py` 中独立实现（仅依赖标准库）。
+- **违规变更通知**：三条片段成功写路径（录入 / 更正 / 批量调整；幂等重放与失败请求除外）在事务内按受影响司机比较变化前后的违规**规则标识集合**（`app/notifications.py` 的 `rule_set_delta`，集合相同不产生事件），仅变化者在**同一事务**写入 `violation_events`（稳定自增事件 ID、司机、变化前后规则、提交时刻），并为匹配的活跃订阅在同事务创建 PENDING 投递记录——片段回滚则事件一并消失。订阅可指定司机或全体司机（`driver_id=NULL`），关注规则与 `rules_before ∪ rules_after` 取交才扇出。
+- **异步有序可重试回调**：进程内后台投递器（`app/dispatcher.py`，随 lifespan 启停，保持原启动方式）按（订阅, 司机）分组，只放行 `event_id` 最小的未完成队头，严格保证“同一订阅同一司机按提交顺序投递”，队头失败/退避不阻塞其他队列；超时或非 2xx 置 FAILED 并记录次数、最近错误、响应码与指数退避时刻继续重试，重试沿用同一事件 ID，回调以共享密钥做 `HMAC-SHA256(timestamp.body)` 签名（`X-Signature: v1=…`）。PostgreSQL 下认领队头使用 `FOR UPDATE SKIP LOCKED` 行级锁，多进程部署至少一次投递，接收方按 `X-Event-Id` 幂等即可。停用订阅在同一事务内把待投递记录置 CANCELLED，不再发送。

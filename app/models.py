@@ -1,7 +1,8 @@
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 
 from .acknowledgment import STATUS_ACTIVE
+from .notifications import DELIVERY_PENDING, SUB_ACTIVE
 from .db import Base
 
 # PostgreSQL 上使用 JSONB，其他数据库（如本地 sqlite 测试）退化为普通 JSON
@@ -92,3 +93,93 @@ class Acknowledgment(Base):
     invalidation = Column(JSONType, nullable=True)  # 失效原因明细（失效时填充，否则为 NULL）
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     invalidated_at = Column(DateTime(timezone=True), nullable=True)
+
+
+# ------------------------------------------------------------ 违规变更通知
+
+
+class NotificationSubscription(Base):
+    """违规状态变更通知订阅。
+
+    - ``driver_id`` 为 NULL 表示订阅**全体司机**，否则只订阅指定司机；
+    - ``rules`` 为关注规则标识列表（去重、白名单校验）；
+    - ``secret`` 为回调共享密钥：每次投递以 HMAC-SHA256 签名；
+    - 停用（``status=DISABLED``）幂等；停用后该订阅尚待投递的事件不再发送
+      （既有投递记录标记 CANCELLED，保留可查）。
+    """
+
+    __tablename__ = "notification_subscriptions"
+
+    subscription_id = Column(String(64), primary_key=True)
+    driver_id = Column(String(64), ForeignKey("drivers.driver_id"), nullable=True, index=True)
+    rules = Column(JSONType, nullable=False)  # ["ROLLING_24H_DUTY_LIMIT", ...]（已去重排序）
+    callback_url = Column(String(2000), nullable=False)
+    secret = Column(String(128), nullable=False)  # 回调签名共享密钥
+    status = Column(String(16), nullable=False, default=SUB_ACTIVE)  # ACTIVE / DISABLED
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    disabled_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ViolationEvent(Base):
+    """司机违规规则集合变更事件。
+
+    片段录入 / 更正 / 跨司机批量调整成功提交时，按受影响司机比较事务前后
+    的违规规则集合，仅集合变化才为该司机产生一个事件；与片段变更在**同一
+    事务**内落库（片段回滚则事件不出现）。``event_id`` 为全局单调递增的
+    稳定 ID，回调与重试始终沿用，幂等重放不产生事件。
+    """
+
+    __tablename__ = "violation_events"
+    __table_args__ = (
+        # 按司机按提交顺序（event_id）查询事件
+        Index("ix_violation_events_driver_event", "driver_id", "event_id"),
+    )
+
+    event_id = Column(Integer, primary_key=True, autoincrement=True)
+    driver_id = Column(String(64), nullable=False)
+    rules_before = Column(JSONType, nullable=False)  # 变化前违规规则标识（排序）
+    rules_after = Column(JSONType, nullable=False)  # 变化后违规规则标识（排序）
+    payload = Column(JSONType, nullable=False)  # 完整回调载荷（稳定结构）
+    committed_at = Column(DateTime(timezone=True), nullable=False)  # 提交时刻（UTC）
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EventDelivery(Base):
+    """某事件对某订阅的一次异步投递（及其重试状态）。
+
+    事件产生时即在同事务内为每个匹配的活跃订阅生成一条 PENDING 记录，
+    因此“同一订阅下同一司机按提交顺序投递”可直接按 ``event_id`` 排序保证。
+    超时或非 2xx 响应：状态置 FAILED、attempts+1、记录最近错误并保留待重试，
+    不影响其他司机 / 订阅，也不回滚已提交片段；订阅停用时待投递记录置
+    CANCELLED，不再发送。
+    """
+
+    __tablename__ = "event_deliveries"
+    __table_args__ = (
+        # 每个事件对每个订阅至多一条投递记录
+        UniqueConstraint("event_id", "subscription_id", name="uq_delivery_event_subscription"),
+        Index("ix_delivery_dispatch", "status", "subscription_id", "driver_id", "event_id"),
+    )
+
+    delivery_id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(
+        Integer, ForeignKey("violation_events.event_id"), nullable=False, index=True
+    )
+    subscription_id = Column(
+        String(64),
+        ForeignKey("notification_subscriptions.subscription_id"),
+        nullable=False,
+        index=True,
+    )
+    # 冗余司机 ID，便于“同订阅同司机按序投递”的队头查询，无需 join 事件表
+    driver_id = Column(String(64), nullable=False)
+    status = Column(String(16), nullable=False, default=DELIVERY_PENDING)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(1000), nullable=True)  # 最近一次失败原因（截断存储）
+    last_response_code = Column(Integer, nullable=True)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)  # 退避后可重试时刻
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

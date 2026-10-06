@@ -159,3 +159,65 @@ req POST /drivers/DRV-3003/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","
 req GET /drivers/DRV-3003/acknowledgments
 req GET '/drivers/DRV-3003/acknowledgments?status=ACTIVE'
 # 期望：列表两条记录（#1 INVALIDATED 附失效原因，#2 ACTIVE）；过滤后只剩 #2
+
+echo "########## 22. 违规变更通知：先建司机，再登记订阅（先起一个本地接收端，见下）"
+req POST /drivers '{"driver_id":"DRV-4004","name":"赵六"}'
+# 可选：用 python3 起一个会打印并验签的本地回调接收端（另开终端执行）：
+#   python3 - <<'PY'
+#   import http.server,hmac,hashlib
+#   class H(http.server.BaseHTTPRequestHandler):
+#       def do_POST(self):
+#           ts=self.headers["X-Signature-Timestamp"]; b=self.rfile.read(int(self.headers["Content-Length"]))
+#           sig=hmac.new(b"shared-secret-01",ts.encode()+b"."+b,hashlib.sha256).hexdigest()
+#           print("收到回调", self.headers["X-Event-Id"], "验签=", sig==self.headers["X-Signature"].split("=",1)[1], b.decode())
+#           self.send_response(200); self.end_headers()
+#   http.server.HTTPServer(("0.0.0.0",9000),H).serve_forever()
+#   PY
+# 全体司机 + 全部规则订阅
+req POST /notification-subscriptions '{
+  "subscription_id":"SUB-ALL-01",
+  "rules":["ROLLING_24H_DUTY_LIMIT","CONTINUOUS_DRIVING_LIMIT"],
+  "callback_url":"http://host.docker.internal:9000/hooks/duty",
+  "secret":"shared-secret-01"
+}'
+echo "---- 同 ID 同内容重放 -> 200 created_new=false；异内容 -> 409"
+req POST /notification-subscriptions '{
+  "subscription_id":"SUB-ALL-01",
+  "rules":["CONTINUOUS_DRIVING_LIMIT","ROLLING_24H_DUTY_LIMIT"],
+  "callback_url":"http://host.docker.internal:9000/hooks/duty",
+  "secret":"shared-secret-01"
+}'
+req POST /notification-subscriptions '{
+  "subscription_id":"SUB-ALL-01","rules":["CONTINUOUS_DRIVING_LIMIT"],
+  "callback_url":"http://host.docker.internal:9000/hooks/duty","secret":"shared-secret-01"
+}'
+echo "---- 指定司机订阅；非法规则 / 密钥过短 / 回调地址非法 -> 400 invalid_subscription"
+req POST /notification-subscriptions '{
+  "subscription_id":"SUB-DRV4","driver_id":"DRV-4004","rules":["CONTINUOUS_DRIVING_LIMIT"],
+  "callback_url":"http://host.docker.internal:9000/hooks/drv4","secret":"shared-secret-02"
+}'
+req POST /notification-subscriptions '{"subscription_id":"SUB-BAD1","rules":["NO_SUCH_RULE"],"callback_url":"https://x/h","secret":"shared-secret-01"}'
+req POST /notification-subscriptions '{"subscription_id":"SUB-BAD2","rules":["CONTINUOUS_DRIVING_LIMIT"],"callback_url":"https://x/h","secret":"short"}'
+req POST /notification-subscriptions '{"subscription_id":"SUB-BAD3","rules":["CONTINUOUS_DRIVING_LIMIT"],"callback_url":"ftp://x/h","secret":"shared-secret-01"}'
+
+echo "########## 23. 触发违规状态变化：DRV-4004 驾驶 08-12 + 12-13 -> 累计驾驶越限事件"
+req POST /segments '{"segment_id":"SEG-N1","driver_id":"DRV-4004","start_utc":"2026-10-09T08:00:00Z","end_utc":"2026-10-09T12:00:00Z","type":"DRIVING"}'
+req POST /segments '{"segment_id":"SEG-N2","driver_id":"DRV-4004","start_utc":"2026-10-09T12:00:00Z","end_utc":"2026-10-09T13:00:00Z","type":"DRIVING"}'
+# 期望：仅第二个片段提交产生 1 个事件（{} -> {CONTINUOUS_DRIVING_LIMIT}），回调带 X-Signature
+
+echo "########## 24. 查询事件与投递状态（重试沿用同一事件 ID）"
+req GET /drivers/DRV-4004/violation-events
+req GET /drivers/DRV-4004/violation-events/1
+req GET /notification-subscriptions/SUB-DRV4/deliveries
+req GET '/notification-subscriptions/SUB-DRV4/deliveries?status=SUCCEEDED'
+
+echo "########## 25. 违规消除 -> 同一司机第 2 个事件（按提交顺序投递，事件 ID 递增）"
+req PATCH /segments/SEG-N2 '{"expected_revision":1,"start_utc":"2026-10-09T12:40:00Z"}'
+req GET /drivers/DRV-4004/violation-events
+# 期望：两个事件（#1 {} -> {stint}；#2 {stint} -> {}），同订阅同司机按 event_id 顺序投递
+
+echo "########## 26. 停用订阅：待投递事件标记 CANCELLED 不再发送（幂等）"
+req POST /notification-subscriptions/SUB-DRV4/disable
+req POST /notification-subscriptions/SUB-DRV4/disable
+req GET /notification-subscriptions/SUB-DRV4/deliveries
+req GET /notification-subscriptions
